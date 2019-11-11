@@ -8,8 +8,12 @@
 //
 #![no_std]
 
+extern crate cortex_m_semihosting as sh;
+
 pub mod max17262 {
+    use core::marker::PhantomData;
     use embedded_hal::blocking::i2c::{Write, WriteRead};
+    use sh::hprintln;
 
     pub struct Max17262Config {
         pub charge_voltage: f32,
@@ -19,7 +23,8 @@ pub mod max17262 {
     }
 
     enum Registers {
-        I2cAddress = 0x6C,
+        //I2cAddress = 0x6C,
+        I2cAddress = 0x36,
         Por = 0x00,
         FstatDnr = 0x3D,
         HibCfg = 0xBA,
@@ -38,87 +43,101 @@ pub mod max17262 {
         FullCapNom = 0x23,
     }
 
-    pub struct Max17262<I> {
-        i2c: I,
+    pub struct Max17262<I2C, Delay> {
+        i2c: PhantomData<I2C>,
+        delay: PhantomData<Delay>,
         recv_buffer: [u8; 2],
     }
     const CHARGE_VOLTAGE_HIGH: u16 = 0x8400;
     const CHARGE_VOLTAGE_LOW: u16 = 0x8000;
 
-    impl<I, E> Max17262<I>
+    impl<I2C, Delay, E> Max17262<I2C, Delay>
     where
-        I: WriteRead<Error = E> + Write<Error = E>,
+        I2C: WriteRead<Error = E> + Write<Error = E>,
+        Delay: embedded_hal::blocking::delay::DelayMs<u8>,
         E: core::fmt::Debug,
     {
-        fn read(&mut self, reg: u8) -> Result<u16, E> {
-            match self
-                .i2c
-                .write_read(Registers::I2cAddress as u8, &[reg], &mut self.recv_buffer)
-            {
+        fn read(&mut self, i2c: &mut I2C, reg: u8) -> Result<u16, E> {
+            match i2c.write_read(Registers::I2cAddress as u8, &[reg], &mut self.recv_buffer) {
                 Ok(_) => Ok((self.recv_buffer[0] as u16) << 8 | self.recv_buffer[1] as u16),
                 Err(e) => Err(e),
             }
         }
 
-        fn write(&mut self, reg: u8, value: u16) -> Result<(), E> {
-            self.i2c.write(Registers::I2cAddress as u8, &[reg])?;
+        fn write(&mut self, i2c: &mut I2C, reg: u8, value: u16) -> Result<(), E> {
+            i2c.write(Registers::I2cAddress as u8, &[reg])?;
             let msb = ((value & 0xFF00) >> 8) as u8;
             let lsb = ((value & 0x00FF) >> 0) as u8;
-            self.i2c.write(Registers::I2cAddress as u8, &[msb, lsb])?;
+            i2c.write(Registers::I2cAddress as u8, &[msb, lsb])?;
             Ok(())
         }
 
-        fn wait(&mut self, _duration: u8) -> Result<(), E> {
+        fn wait(&mut self, delay: &mut Delay, _duration: u8) -> Result<(), E> {
+            delay.delay_ms(_duration);
             Ok(())
         }
 
-        fn config(&mut self, cfg: Max17262Config) -> Result<(), E> {
-            if self.read(Registers::Por as u8).unwrap() & 0x0002 == 0 {
-                while self.read(Registers::FstatDnr as u8).unwrap() & 1 != 0 {
+        fn config(
+            &mut self,
+            i2c: &mut I2C,
+            delay: &mut Delay,
+            cfg: Max17262Config,
+        ) -> Result<(), E> {
+            hprintln!("MAX17262: Configuring").unwrap();
+            if self.read(i2c, Registers::Por as u8).unwrap() & 0x0002 == 0 {
+                hprintln!("MAX17262: POR & 0x0002 == 0").unwrap();
+                while self.read(i2c, Registers::FstatDnr as u8).unwrap() & 1 != 0 {
+                    hprintln!("MAX17262: FstatDnr & 1 != 0").unwrap();
                     // 10ms Wait Loop. Do not continue until FSTAT.DNR==0
-                    self.wait(10).ok();
+                    self.wait(delay, 10).ok();
                 }
-                let hib_cfg = self.read(Registers::HibCfg as u8).unwrap(); //Store original HibCFG value
-                self.write(Registers::HibCtrl as u8, 0x90).unwrap(); // Exit Hibernate Mode step 1
-                self.write(Registers::HibCfg as u8, 0x0).unwrap(); // Exit Hibernate Mode step 2
-                self.write(Registers::HibCtrl as u8, 0x0).unwrap(); // Exit Hibernate Mode step 3
-                self.write(Registers::DesignCap as u8, cfg.design_cap)
+                let hib_cfg = self.read(i2c, Registers::HibCfg as u8).unwrap(); //Store original HibCFG value
+                self.write(i2c, Registers::HibCtrl as u8, 0x90).unwrap(); // Exit Hibernate Mode step 1
+                self.write(i2c, Registers::HibCfg as u8, 0x0).unwrap(); // Exit Hibernate Mode step 2
+                self.write(i2c, Registers::HibCtrl as u8, 0x0).unwrap(); // Exit Hibernate Mode step 3
+                self.write(i2c, Registers::DesignCap as u8, cfg.design_cap)
                     .unwrap();
-                self.write(Registers::IchgTerm as u8, cfg.ichg_term)
+                self.write(i2c, Registers::IchgTerm as u8, cfg.ichg_term)
                     .unwrap();
-                self.write(Registers::Vempty as u8, cfg.vempty).unwrap();
+                self.write(i2c, Registers::Vempty as u8, cfg.vempty)
+                    .unwrap();
                 if cfg.charge_voltage > 4.275 {
-                    self.write(Registers::ModelCfg as u8, CHARGE_VOLTAGE_HIGH)
+                    self.write(i2c, Registers::ModelCfg as u8, CHARGE_VOLTAGE_HIGH)
                         .unwrap();
                 } else {
-                    self.write(Registers::ModelCfg as u8, CHARGE_VOLTAGE_LOW)
+                    self.write(i2c, Registers::ModelCfg as u8, CHARGE_VOLTAGE_LOW)
                         .unwrap();
                 }
                 //Poll ModelCFG.Refresh(highest bit),
                 //proceed when ModelCFG.Refresh=0.
-                while self.read(Registers::ModelCfg as u8).unwrap() & 0x8000 != 0 {
-                    self.wait(10).unwrap();
+                while self.read(i2c, Registers::ModelCfg as u8).unwrap() & 0x8000 != 0 {
+                    self.wait(delay, 10).unwrap();
                 }
                 //do not continue until ModelCFG.Refresh==0
-                self.write(0xBA, hib_cfg).unwrap(); // Restore Original HibCFG value
+                self.write(i2c, 0xBA, hib_cfg).unwrap(); // Restore Original HibCFG value
             }
+            hprintln!("MAX17262: Model loaded ").unwrap();
             // Clear the POR bit to indicate that the custom model and parameters were successfully loaded.
-            let status = self.read(Registers::Por as u8).unwrap();
-            self.write(Registers::Por as u8, status & 0xFFFD).unwrap();
+            let status = self.read(i2c, Registers::Por as u8).unwrap();
+            hprintln!("MAX17262: status {}", status).unwrap();
+            self.write(i2c, Registers::Por as u8, status & 0xFFFD)
+                .unwrap();
+            hprintln!("MAX17262: status updated").unwrap();
             Ok(())
         }
 
-        pub fn new(i2c: I, cfg: Max17262Config) -> Self {
+        pub fn new(i2c: &mut I2C, delay: &mut Delay, cfg: Max17262Config) -> Self {
             let mut max = Max17262 {
-                i2c: i2c,
+                i2c: PhantomData,
+                delay: PhantomData,
                 recv_buffer: [0u8; 2],
             };
-            max.config(cfg).unwrap();
+            max.config(i2c, delay, cfg).unwrap();
             max
         }
 
-        pub fn state_of_charge(&mut self) -> Result<u16, E> {
-            self.read(Registers::RepSoC as u8)
+        pub fn state_of_charge(&mut self, i2c: &mut I2C) -> Result<u16, E> {
+            self.read(i2c, Registers::RepSoC as u8)
         }
     }
 }
