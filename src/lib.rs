@@ -41,6 +41,9 @@ enum Register {
     FullCapNom = 0x23,
 }
 
+const CHARGE_VOLTAGE_HIGH: u16 = 0x8400;
+const CHARGE_VOLTAGE_LOW: u16 = 0x8000;
+
 impl Register {
     pub fn addr(&self) -> u8 {
         *self as u8
@@ -51,8 +54,6 @@ pub struct Max17262<I2C, Delay> {
     delay: PhantomData<Delay>,
     recv_buffer: [u8; 2],
 }
-const CHARGE_VOLTAGE_HIGH: u16 = 0x8400;
-const CHARGE_VOLTAGE_LOW: u16 = 0x8000;
 
 impl<I2C, Delay, E> Max17262<I2C, Delay>
 where
@@ -60,6 +61,7 @@ where
     Delay: embedded_hal::blocking::delay::DelayMs<u8>,
     E: core::fmt::Debug,
 {
+
     fn read(&mut self, i2c: &mut I2C, reg: u8) -> Result<u16, E> {
         match i2c.write_read(Register::I2cAddress.addr(), &[reg], &mut self.recv_buffer) {
             Ok(_) => Ok((self.recv_buffer[0] as u16) << 8 | self.recv_buffer[1] as u16),
@@ -99,7 +101,7 @@ where
                 delay.delay_ms(10);
             }
             //do not continue until ModelCFG.Refresh==0
-            self.write(i2c, 0xBA, hib_cfg)?; // Restore Original HibCFG value
+            self.write(i2c, Register::HibCfg.addr(), hib_cfg)?; // Restore Original HibCFG value
         }
         // Clear the POR bit to indicate that the custom model and parameters were successfully loaded.
         let status = self.read(i2c, Register::Por.addr()).unwrap();
